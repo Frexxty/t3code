@@ -2247,6 +2247,100 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("completes a related child once when its idle status precedes deletion", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-idle-then-deleted");
+      const parentSessionId = "http://127.0.0.1:9999/session";
+      const busy = promiseWithResolvers<unknown>();
+      const childCreated = promiseWithResolvers<unknown>();
+      const childIdle = promiseWithResolvers<unknown>();
+      const childDeleted = promiseWithResolvers<unknown>();
+      const idle = promiseWithResolvers<unknown>();
+      runtimeMock.state.sessionStatus = "busy";
+      runtimeMock.state.subscribedEvents = [
+        busy.promise,
+        childCreated.promise,
+        childIdle.promise,
+        childDeleted.promise,
+        idle.promise,
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            (event.type === "task.started" ||
+              event.type === "task.completed" ||
+              event.type === "turn.completed"),
+        ),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "Delegate to a child",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        })
+        .pipe(Effect.forkChild);
+      busy.resolve({
+        id: "evt-child-delete-busy",
+        type: "session.status",
+        properties: { sessionID: parentSessionId, status: { type: "busy" } },
+      });
+      yield* Fiber.join(sendFiber);
+
+      childCreated.resolve({
+        id: "evt-child-delete-created",
+        type: "session.created",
+        properties: {
+          sessionID: "ses_child_delete",
+          info: {
+            id: "ses_child_delete",
+            parentID: parentSessionId,
+            title: "Child task",
+          },
+        },
+      });
+      yield* Effect.yieldNow;
+      childIdle.resolve({
+        id: "evt-child-delete-idle",
+        type: "session.status",
+        properties: { sessionID: "ses_child_delete", status: { type: "idle" } },
+      });
+      yield* Effect.yieldNow;
+      childDeleted.resolve({
+        id: "evt-child-delete-deleted",
+        type: "session.deleted",
+        properties: { info: { id: "ses_child_delete", title: "Child task" } },
+      });
+      yield* Effect.yieldNow;
+      runtimeMock.state.sessionStatus = "idle";
+      idle.resolve({
+        id: "evt-child-delete-parent-idle",
+        type: "session.status",
+        properties: { sessionID: parentSessionId, status: { type: "idle" } },
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["task.started", "task.completed", "turn.completed"],
+      );
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("sums owned OpenCode step usage and marks unresolved usage partial", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

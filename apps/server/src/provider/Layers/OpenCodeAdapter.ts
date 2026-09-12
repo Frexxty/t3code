@@ -8,6 +8,7 @@ import {
   type ProviderSession,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   ThreadId,
   type ToolLifecycleItemType,
   type TurnTokenUsage,
@@ -1705,7 +1706,11 @@ export function makeOpenCodeAdapter(
           ),
         );
       let sessionId: string | undefined = candidateSessionId;
-      for (let depth = 0; sessionId !== undefined && depth < 32; depth += 1) {
+      // `seen` bounds the walk: a session can have only one parent, so the
+      // chain terminates on a cycle, a root (`parentID` undefined), or a 404.
+      // A fixed hop cap would instead misreport a deep-but-related descendant
+      // as unrelated and drop its queued terminal events.
+      while (sessionId !== undefined) {
         if (context.relatedSessionIds.has(sessionId)) {
           addRelatedOpenCodeSession(context, candidateSessionId);
           return true;
@@ -2076,7 +2081,8 @@ export function makeOpenCodeAdapter(
             const relation = yield* isRelatedOpenCodeSession(context, sessionId).pipe(
               Effect.match({
                 onFailure: () => "unknown" as const,
-                onSuccess: (related) => (related ? "related" : "unrelated") as const,
+                onSuccess: (related): "related" | "unrelated" =>
+                  related ? "related" : "unrelated",
               }),
             );
             if (context.sessionRelationRetries.get(sessionId) !== retry) return;
@@ -2087,8 +2093,6 @@ export function makeOpenCodeAdapter(
             if (relation === "related") {
               context.sessionRelationRetries.delete(sessionId);
               for (const { event: replayEvent, turnId: replayTurnId } of retry.events) {
-                const replaySession =
-                  replayEvent.type === "session.status" ? undefined : replayEvent.properties.info;
                 const base = yield* buildEventBase({
                   threadId: context.session.threadId,
                   turnId: replayTurnId,
@@ -2096,22 +2100,24 @@ export function makeOpenCodeAdapter(
                   raw: replayEvent,
                 });
                 if (replayEvent.type === "session.created") {
+                  const replaySession = replayEvent.properties.info;
                   yield* emit({
                     ...base,
                     type: "task.started",
                     payload: {
-                      taskId: sessionId,
+                      taskId: RuntimeTaskId.make(sessionId),
                       taskType: "local_agent",
                       title: replaySession.title,
                       description: replaySession.title,
                     },
                   });
                 } else if (replayEvent.type === "session.updated") {
+                  const replaySession = replayEvent.properties.info;
                   yield* emit({
                     ...base,
                     type: "task.progress",
                     payload: {
-                      taskId: sessionId,
+                      taskId: RuntimeTaskId.make(sessionId),
                       taskType: "local_agent",
                       title: replaySession.title,
                       description: replaySession.title,
@@ -2131,10 +2137,13 @@ export function makeOpenCodeAdapter(
                     ...base,
                     type: "task.completed",
                     payload: {
-                      taskId: sessionId,
+                      taskId: RuntimeTaskId.make(sessionId),
                       taskType: "local_agent",
                       status: "completed",
-                      summary: replaySession?.title ?? "Completed",
+                      summary:
+                        (replayEvent.type === "session.deleted"
+                          ? replayEvent.properties.info.title
+                          : undefined) ?? "Completed",
                     },
                   });
                   return;
@@ -2414,7 +2423,7 @@ export function makeOpenCodeAdapter(
               })),
               type: "task.started",
               payload: {
-                taskId: session.id,
+                taskId: RuntimeTaskId.make(session.id),
                 taskType: "local_agent",
                 title: session.title,
                 description: session.title,
@@ -2435,7 +2444,7 @@ export function makeOpenCodeAdapter(
               })),
               type: "task.progress",
               payload: {
-                taskId: session.id,
+                taskId: RuntimeTaskId.make(session.id),
                 taskType: "local_agent",
                 title: session.title,
                 description: session.title,
@@ -2465,6 +2474,9 @@ export function makeOpenCodeAdapter(
         case "session.deleted": {
           if (!isParentEvent) {
             const session = event.properties.info;
+            context.relatedSessionIds.delete(session.id);
+            if (context.terminalChildSessionIds.has(session.id)) break;
+            context.terminalChildSessionIds.add(session.id);
             yield* emit({
               ...(yield* buildEventBase({
                 threadId: context.session.threadId,
@@ -2474,13 +2486,12 @@ export function makeOpenCodeAdapter(
               })),
               type: "task.completed",
               payload: {
-                taskId: session.id,
+                taskId: RuntimeTaskId.make(session.id),
                 taskType: "local_agent",
                 status: "completed",
                 summary: session.title,
               },
             });
-            context.relatedSessionIds.delete(session.id);
           }
           break;
         }
@@ -2773,7 +2784,7 @@ export function makeOpenCodeAdapter(
                 })),
                 type: "task.completed",
                 payload: {
-                  taskId: sessionId,
+                  taskId: RuntimeTaskId.make(sessionId),
                   taskType: "local_agent",
                   status: "completed",
                   summary: "Completed",
